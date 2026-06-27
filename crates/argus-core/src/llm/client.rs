@@ -6,12 +6,41 @@ use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::Duration;
 
+/// Prompt/completion token counts from one request, as reported by the
+/// endpoint's `usage` block. Zero when the endpoint omits usage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn total(&self) -> u64 {
+        self.prompt_tokens + self.completion_tokens
+    }
+}
+
+impl std::ops::AddAssign for TokenUsage {
+    fn add_assign(&mut self, rhs: Self) {
+        self.prompt_tokens += rhs.prompt_tokens;
+        self.completion_tokens += rhs.completion_tokens;
+    }
+}
+
+/// The assistant's reply text plus the token usage the call consumed.
+#[derive(Debug, Clone, Default)]
+pub struct Completion {
+    pub text: String,
+    pub usage: TokenUsage,
+}
+
 /// A minimal chat-completion seam. One method: send a system + user message,
-/// get the assistant's text back. Async so the scanner can run many requests
-/// concurrently under a semaphore; object-safe so tests inject a mock.
+/// get the assistant's text back plus token usage. Async so the scanner can run
+/// many requests concurrently under a semaphore; object-safe so tests inject a
+/// mock.
 #[async_trait]
 pub trait LlmClient: Send + Sync {
-    async fn complete(&self, system: &str, user: &str) -> Result<String>;
+    async fn complete(&self, system: &str, user: &str) -> Result<Completion>;
 }
 
 /// OpenAI-compatible client targeting a self-hosted SGLang `/chat/completions`.
@@ -58,7 +87,7 @@ impl OpenAiClient {
         format!("{}/chat/completions", self.base_url)
     }
 
-    async fn post_once(&self, body: &ChatRequest<'_>) -> Result<String> {
+    async fn post_once(&self, body: &ChatRequest<'_>) -> Result<Completion> {
         let resp = self
             .http
             .post(self.endpoint())
@@ -92,13 +121,23 @@ impl OpenAiClient {
                 }
             })
             .unwrap_or_default();
-        Ok(content)
+        let usage = parsed
+            .usage
+            .map(|u| TokenUsage {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+            })
+            .unwrap_or_default();
+        Ok(Completion {
+            text: content,
+            usage,
+        })
     }
 }
 
 #[async_trait]
 impl LlmClient for OpenAiClient {
-    async fn complete(&self, system: &str, user: &str) -> Result<String> {
+    async fn complete(&self, system: &str, user: &str) -> Result<Completion> {
         let body = ChatRequest {
             model: &self.model,
             temperature: 0.0,
@@ -118,7 +157,7 @@ impl LlmClient for OpenAiClient {
         };
 
         match self.post_once(&body).await {
-            Ok(text) => Ok(text),
+            Ok(completion) => Ok(completion),
             Err(first) => {
                 tracing::warn!(error = %first, "LLM request failed; retrying once");
                 tokio::time::sleep(Duration::from_millis(750)).await;
@@ -155,6 +194,17 @@ struct Message<'a> {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    /// OpenAI-style token accounting. Absent on endpoints that don't report it.
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+#[derive(Deserialize)]
+struct Usage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -215,14 +265,23 @@ impl MockLlmClient {
 
 #[async_trait]
 impl LlmClient for MockLlmClient {
-    async fn complete(&self, system: &str, user: &str) -> Result<String> {
+    async fn complete(&self, system: &str, user: &str) -> Result<Completion> {
         self.seen_prompts
             .lock()
             .unwrap()
             .push((system.to_string(), user.to_string()));
-        let mut q = self.responses.lock().unwrap();
-        Ok(q.pop_front()
-            .unwrap_or_else(|| self.last.lock().unwrap().clone()))
+        let text = {
+            let mut q = self.responses.lock().unwrap();
+            q.pop_front()
+                .unwrap_or_else(|| self.last.lock().unwrap().clone())
+        };
+        // Report deterministic, non-zero usage so token-accounting tests have
+        // something to add up (chars/4, the same estimate the chunker uses).
+        let usage = TokenUsage {
+            prompt_tokens: ((system.len() + user.len()) / 4) as u64,
+            completion_tokens: (text.len() / 4) as u64,
+        };
+        Ok(Completion { text, usage })
     }
 }
 

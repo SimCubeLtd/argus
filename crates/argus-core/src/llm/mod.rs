@@ -4,4 +4,4 @@
 mod client;
 pub mod prompts;
 
-pub use client::{LlmClient, MockLlmClient, OpenAiClient};
+pub use client::{Completion, LlmClient, MockLlmClient, OpenAiClient, TokenUsage};

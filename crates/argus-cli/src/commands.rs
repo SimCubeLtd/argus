@@ -69,6 +69,23 @@ pub async fn scan(root: &Path, settings: &Resolved, date: &str, now: &str) -> Re
         eprintln!("warning: Synapse graph produced no context packs — scanned file-only.");
     }
 
+    // Token accounting — lets operators gauge the cost of a metered endpoint.
+    let u = outcome.token_usage;
+    if u.total() > 0 {
+        eprintln!(
+            "Tokens: {} prompt + {} completion = {} total over {} LLM request(s).",
+            fmt_int(u.prompt_tokens),
+            fmt_int(u.completion_tokens),
+            fmt_int(u.total()),
+            outcome.llm_requests,
+        );
+    } else if outcome.llm_requests > 0 {
+        eprintln!(
+            "Tokens: endpoint reported no usage data ({} LLM request(s) made).",
+            outcome.llm_requests
+        );
+    }
+
     let meta = ReportMeta {
         scan_mode: outcome.mode.label().to_string(),
         commit: outcome.head_sha.clone(),
@@ -77,6 +94,20 @@ pub async fn scan(root: &Path, settings: &Resolved, date: &str, now: &str) -> Re
     let path = write_report(root, &settings.report_dir, date, &store, &meta)?;
     println!("{}", path.display());
     Ok(())
+}
+
+/// Format an integer with thousands separators (e.g. 1234567 -> "1,234,567").
+fn fmt_int(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
 }
 
 /// `argus dismiss <fp>` / `argus confirm <fp>`.
@@ -146,5 +177,19 @@ fn build_provider(root: &Path, settings: &Resolved) -> (Arc<dyn ContextProvider>
                 false,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_int;
+
+    #[test]
+    fn fmt_int_groups_thousands() {
+        assert_eq!(fmt_int(0), "0");
+        assert_eq!(fmt_int(42), "42");
+        assert_eq!(fmt_int(1_000), "1,000");
+        assert_eq!(fmt_int(1_234_567), "1,234,567");
+        assert_eq!(fmt_int(999), "999");
     }
 }

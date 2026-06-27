@@ -86,6 +86,16 @@ async fn new_finding_is_pending_and_appears_in_report() {
     assert_eq!(outcome.new_findings, 1);
     assert!(outcome.context_available);
 
+    // Token accounting: one file, one chunk => two LLM calls (pass 1 + pass 2),
+    // and the mock reports non-zero usage for each, so totals must accumulate.
+    assert_eq!(outcome.llm_requests, 2);
+    assert!(outcome.token_usage.prompt_tokens > 0);
+    assert!(outcome.token_usage.completion_tokens > 0);
+    assert_eq!(
+        outcome.token_usage.total(),
+        outcome.token_usage.prompt_tokens + outcome.token_usage.completion_tokens
+    );
+
     let all = store.all().unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].state, TriageState::Pending);

@@ -11,8 +11,8 @@ pub mod model;
 
 use crate::chunk::{self, Chunk};
 use crate::context::ContextProvider;
-use crate::llm::LlmClient;
 use crate::llm::prompts::{self, SYSTEM_PROMPT};
+use crate::llm::{LlmClient, TokenUsage};
 use crate::scan::model::{Finding, RawFinding, Severity, TriageState};
 use crate::store::{FindingStore, LastRun};
 use anyhow::Result;
@@ -47,6 +47,32 @@ pub struct ScanOutcome {
     pub new_findings: usize,
     pub context_available: bool,
     pub head_sha: Option<String>,
+    /// Total prompt + completion tokens the endpoint reported across every LLM
+    /// call this scan. Zero if the endpoint omits usage. Lets operators gauge
+    /// the cost of pointing Argus at a metered endpoint.
+    pub token_usage: crate::llm::TokenUsage,
+    /// Number of LLM requests made (two passes per chunk, plus retries).
+    pub llm_requests: u64,
+}
+
+/// Running tally of LLM cost for a scan: summed token usage and request count.
+#[derive(Debug, Clone, Copy, Default)]
+struct Meter {
+    usage: TokenUsage,
+    requests: u64,
+}
+
+impl Meter {
+    /// Record one completed LLM request.
+    fn record(&mut self, usage: TokenUsage) {
+        self.usage += usage;
+        self.requests += 1;
+    }
+
+    fn merge(&mut self, other: Meter) {
+        self.usage += other.usage;
+        self.requests += other.requests;
+    }
 }
 
 /// Knobs resolved by the caller (CLI), passed in explicitly so core never reads
@@ -107,12 +133,14 @@ pub async fn run_scan(
     }
 
     let mut detected: Vec<Finding> = Vec::new();
+    let mut meter = Meter::default();
     for h in handles {
-        let (findings, had_context) = h.await.expect("scan task panicked")?;
+        let (findings, had_context, file_meter) = h.await.expect("scan task panicked")?;
         if had_context {
             context_available = true;
         }
         detected.extend(findings);
+        meter.merge(file_meter);
     }
 
     // 4. Reconcile: which fingerprints are genuinely new (for the count).
@@ -135,12 +163,14 @@ pub async fn run_scan(
         new_findings,
         context_available,
         head_sha,
+        token_usage: meter.usage,
+        llm_requests: meter.requests,
     })
 }
 
 /// Triage a single file: fetch its context pack, chunk it, run the two-pass LLM
 /// per chunk, map lines back, and merge into fingerprinted findings. Returns the
-/// findings plus whether a non-empty context pack was used.
+/// findings, whether a non-empty context pack was used, and the LLM cost meter.
 async fn triage_file(
     root: &Path,
     rel: &str,
@@ -148,13 +178,13 @@ async fn triage_file(
     llm: &dyn LlmClient,
     params: &ScanParams,
     now: &str,
-) -> Result<(Vec<Finding>, bool)> {
+) -> Result<(Vec<Finding>, bool, Meter)> {
     let abs = root.join(rel);
     let code = match std::fs::read_to_string(&abs) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(file = rel, error = %e, "skipping unreadable file");
-            return Ok((Vec::new(), false));
+            return Ok((Vec::new(), false, Meter::default()));
         }
     };
 
@@ -168,15 +198,17 @@ async fn triage_file(
     // Merge chunk findings into one map per (vuln_type, mapped first line) so the
     // same issue reported in overlapping chunks doesn't double up.
     let mut merged: BTreeMap<String, Finding> = BTreeMap::new();
+    let mut meter = Meter::default();
     for chunk in &chunks {
-        let raws = scan_chunk(rel, chunk, &context_pack, llm).await?;
+        let (raws, chunk_meter) = scan_chunk(rel, chunk, &context_pack, llm).await?;
+        meter.merge(chunk_meter);
         for raw in raws {
             let finding = build_finding(rel, &raw, chunk, now);
             merged.entry(finding.fingerprint.clone()).or_insert(finding);
         }
     }
 
-    Ok((merged.into_values().collect(), had_context))
+    Ok((merged.into_values().collect(), had_context, meter))
 }
 
 /// Run the two-pass prompt sequence for one chunk and parse the final findings.
@@ -187,23 +219,26 @@ async fn scan_chunk(
     chunk: &Chunk,
     context_pack: &str,
     llm: &dyn LlmClient,
-) -> Result<Vec<RawFinding>> {
+) -> Result<(Vec<RawFinding>, Meter)> {
+    let mut meter = Meter::default();
+
     // Pass 1 — discover candidates. We don't strictly need to parse them; the
     // raw JSON text is fed straight into pass 2, so a malformed pass-1 reply
     // still lets pass 2 run with whatever the model produced.
     let discover = prompts::discover_prompt(file, &chunk.text, context_pack);
-    let candidates_raw = llm.complete(SYSTEM_PROMPT, &discover).await?;
+    let pass1 = llm.complete(SYSTEM_PROMPT, &discover).await?;
+    meter.record(pass1.usage);
     let candidates_json =
-        prompts::extract_json_array(&candidates_raw).unwrap_or_else(|| "[]".to_string());
+        prompts::extract_json_array(&pass1.text).unwrap_or_else(|| "[]".to_string());
 
     // Pass 2 — evaluate into final findings, with a single parse retry.
     let evaluate = prompts::evaluate_prompt(file, &chunk.text, context_pack, &candidates_json);
-    let raws = match complete_and_parse(llm, &evaluate).await? {
+    let raws = match complete_and_parse(llm, &evaluate, &mut meter).await? {
         Some(r) => r,
         None => {
             // One retry with an explicit "JSON only" nudge.
             let retry = format!("{evaluate}\n\nIMPORTANT: respond with the JSON array ONLY.");
-            match complete_and_parse(llm, &retry).await? {
+            match complete_and_parse(llm, &retry, &mut meter).await? {
                 Some(r) => r,
                 None => {
                     tracing::warn!(
@@ -215,14 +250,20 @@ async fn scan_chunk(
             }
         }
     };
-    Ok(raws)
+    Ok((raws, meter))
 }
 
-/// Send a prompt and parse the reply into `RawFinding`s. Returns `Ok(None)` when
-/// no JSON array could be extracted/deserialized (the caller decides on retry).
-async fn complete_and_parse(llm: &dyn LlmClient, user: &str) -> Result<Option<Vec<RawFinding>>> {
+/// Send a prompt and parse the reply into `RawFinding`s, recording token usage
+/// into `meter`. Returns `Ok(None)` when no JSON array could be
+/// extracted/deserialized (the caller decides on retry).
+async fn complete_and_parse(
+    llm: &dyn LlmClient,
+    user: &str,
+    meter: &mut Meter,
+) -> Result<Option<Vec<RawFinding>>> {
     let reply = llm.complete(SYSTEM_PROMPT, user).await?;
-    let Some(json) = prompts::extract_json_array(&reply) else {
+    meter.record(reply.usage);
+    let Some(json) = prompts::extract_json_array(&reply.text) else {
         return Ok(None);
     };
     match serde_json::from_str::<Vec<RawFinding>>(&json) {
