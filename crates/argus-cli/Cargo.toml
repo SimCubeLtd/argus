@@ -1,0 +1,31 @@
+[package]
+name = "argus-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Argus CLI — local daily LLM security triage for any codebase."
+
+[[bin]]
+name = "argus"
+path = "src/main.rs"
+
+[dependencies]
+# argus-core with the Synapse-backed context provider wired in.
+argus-core = { path = "../argus-core", features = ["synapse"] }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+indicatif.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+assert_cmd = "2.0"
+predicates = "3.1"
+wiremock = "0.6"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

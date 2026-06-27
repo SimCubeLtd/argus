@@ -1,0 +1,38 @@
+[package]
+name = "argus-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core scanning logic for Argus — LLM codebase security triage."
+
+[features]
+# Off by default so `cargo test -p argus-core` needs no LadybugDB/C++ build.
+# `argus-cli` turns this on to wire the real Synapse-backed context provider.
+default = []
+synapse = ["dep:synapse"]
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait = "0.1"
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+ignore.workspace = true
+toml.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+
+# The Synapse context engine — graph index + token-budgeted context packs.
+# default-features = false drops `share` (OCI/TLS); `ladybug` is re-enabled so
+# the graph store builds. Only compiled when the `synapse` feature is on.
+synapse = { git = "https://github.com/SimCubeLtd/synapse", tag = "v0.2.2", default-features = false, features = [
+    "ladybug",
+], optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }

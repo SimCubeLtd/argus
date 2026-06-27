@@ -1,0 +1,7 @@
+/target
+
+# Argus triage state — local-only (config, findings, last-run marker, reports).
+/.triage-state/
+
+# Synapse graph workspace that Argus drives — also local-only.
+/.synapse/
