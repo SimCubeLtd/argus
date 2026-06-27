@@ -34,9 +34,34 @@ file handling, race conditions on security-relevant state.
 
 You are given the TARGET CODE plus a CONTEXT PACK (its callers, base types, and \
 sibling files from a code graph). USE THE CONTEXT: if input is validated by a \
-caller or a base type/handler already enforces auth, do not flag it. Prefer \
-precision over recall — a daily triage feed must not drown reviewers in false \
-positives.
+caller or a base type/handler already enforces auth, do not flag it.
+
+THE REACHABILITY TEST (apply to EVERY candidate before reporting it). A finding \
+is REAL only if you can name a concrete path by which an UNTRUSTED, \
+ATTACKER-CONTROLLED value reaches the dangerous sink. Untrusted = data crossing \
+a trust boundary at runtime: an HTTP request/body/header/query, a webhook, an \
+uploaded file, a message off a queue, or third-party API output. The following \
+are NOT untrusted and MUST NOT be flagged on their own:
+- A CLI flag, argument, env var, or local config file value. The operator \
+running the tool is trusted; configuring their own tool is not an attack.
+- A constant, hard-coded literal, or value the program itself produces.
+- A file path the program is explicitly designed to read/write as its job \
+(a scanner reading source files, a report writer emitting its output file).
+- The mere USE of a powerful API (spawning a subprocess with fixed/derived \
+args, `reqwest`/HTTP to a configured endpoint, reading a file, deserializing \
+trusted local state). Capability is not vulnerability.
+
+Concretely, do NOT report: 'SSRF' because a URL/base-url is configurable; \
+'path traversal' because the program reads a path it was given; 'command \
+injection' when subprocess args are fixed or derived from trusted local data; \
+'XSS' when the output is not served as HTML to a browser (e.g. a Markdown \
+report, a log line, a terminal); 'prompt injection' as a finding about the \
+tool's own intended design.
+
+DEFAULT TO NOT-A-FINDING. If you cannot trace attacker-controlled input to the \
+sink, drop it. Prefer precision over recall HARD — a daily triage feed that \
+cries wolf gets ignored. It is far better to miss a borderline issue than to \
+emit a false positive.
 
 Always respond with JSON only. No prose, no markdown fences.";
 
@@ -74,21 +99,30 @@ pub fn evaluate_prompt(
          ## CANDIDATE PATTERNS (from pass 1)\n\
          {candidates}\n\n\
          ## TASK (pass 2 of 2 — EVALUATE)\n\
-         Evaluate each candidate against the code and context. DROP false \
-         positives the context rules out (validated upstream, auth enforced, not \
-         reachable with attacker input). For each REAL issue, emit a finding.\n\n\
+         Apply THE REACHABILITY TEST from your instructions to each candidate. \
+         For a candidate to survive, you must be able to state a concrete path by \
+         which ATTACKER-CONTROLLED input (HTTP request, upload, queue message, \
+         third-party response — NOT a CLI flag, env var, config value, constant, \
+         or a file the program is designed to handle) reaches the sink. If you \
+         cannot, DROP it. When in doubt, DROP it.\n\n\
+         For each surviving REAL issue, emit a finding. The `reachability` field \
+         must name the untrusted source and trace it to the sink in one sentence; \
+         if you find yourself writing \"if an attacker could control...\" about a \
+         CLI/config/constant value, that is NOT a finding — drop it.\n\n\
          Respond with a JSON array of objects with EXACTLY these fields:\n\
          [{{\
          \"vulnerability_type\": \"...\", \
          \"description\": \"...\", \
          \"severity\": \"Critical|High|Medium|Low|Info\", \
          \"line_numbers\": [12], \
+         \"reachability\": \"untrusted source X reaches sink Y via ...\", \
          \"impact\": \"...\", \
          \"recommendation\": \"...\", \
          \"fix_example\": \"...\"\
          }}]\n\
          `line_numbers` are 1-based lines in the TARGET FILE above. Return [] if \
-         there are no real issues.",
+         there are no real issues — an empty array is the EXPECTED result for \
+         most files.",
         file = file,
         code = code,
         context_section = context_block(context_pack),
@@ -175,6 +209,24 @@ mod tests {
         assert!(p.contains("vulnerability_type"));
         assert!(p.contains("fix_example"));
         assert!(p.contains("[{\"pattern\":\"x\"}]"));
+    }
+
+    #[test]
+    fn prompts_enforce_the_reachability_gate() {
+        // The precision fix: the model must trace attacker-controlled input to a
+        // sink and default to not-a-finding. Guard the key phrasing so a future
+        // edit can't silently loosen it back into the over-flagging behaviour.
+        assert!(SYSTEM_PROMPT.contains("REACHABILITY TEST"));
+        assert!(SYSTEM_PROMPT.contains("DEFAULT TO NOT-A-FINDING"));
+        // The exact false-positive classes seen on real scans are named as
+        // must-not-flag examples.
+        assert!(SYSTEM_PROMPT.contains("CLI flag"));
+        assert!(SYSTEM_PROMPT.contains("Capability is not vulnerability"));
+
+        let p = evaluate_prompt("a.cs", "code", "ctx", "[]");
+        assert!(p.contains("REACHABILITY TEST"));
+        assert!(p.contains("reachability"));
+        assert!(p.contains("When in doubt, DROP it"));
     }
 
     #[test]

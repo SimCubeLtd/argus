@@ -97,6 +97,9 @@ fn render_finding(out: &mut String, f: &Finding) {
     if !f.description.is_empty() {
         out.push_str(&format!("- **Description**: {}\n", f.description));
     }
+    if !f.reachability.is_empty() {
+        out.push_str(&format!("- **Reachability**: {}\n", f.reachability));
+    }
     if !f.impact.is_empty() {
         out.push_str(&format!("- **Impact**: {}\n", f.impact));
     }
@@ -135,6 +138,7 @@ mod tests {
             description: "desc".into(),
             severity: sev,
             line_numbers: vec![line],
+            reachability: "http request -> sink".into(),
             impact: "impact".into(),
             recommendation: "rec".into(),
             fix_example: String::new(),

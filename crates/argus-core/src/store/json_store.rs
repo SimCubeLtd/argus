@@ -138,6 +138,7 @@ mod tests {
             description: "d".into(),
             severity: Severity::High,
             line_numbers: vec![3],
+            reachability: "http body -> query".into(),
             impact: "i".into(),
             recommendation: "r".into(),
             fix_example: String::new(),

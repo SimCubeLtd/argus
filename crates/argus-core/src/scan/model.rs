@@ -92,6 +92,11 @@ pub struct RawFinding {
     /// true file lines during merge.
     #[serde(default)]
     pub line_numbers: Vec<u32>,
+    /// The model's one-line trace of how attacker-controlled input reaches the
+    /// sink. Empty for older/looser responses; surfaced so reviewers can sanity-
+    /// check the reachability claim that justifies the finding.
+    #[serde(default)]
+    pub reachability: String,
     #[serde(default)]
     pub impact: String,
     #[serde(default)]
@@ -110,6 +115,9 @@ pub struct Finding {
     pub description: String,
     pub severity: Severity,
     pub line_numbers: Vec<u32>,
+    /// One-line attacker-input → sink trace justifying the finding (may be empty).
+    #[serde(default)]
+    pub reachability: String,
     pub impact: String,
     pub recommendation: String,
     #[serde(default)]

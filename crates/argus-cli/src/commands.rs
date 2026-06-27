@@ -41,6 +41,7 @@ pub async fn scan(root: &Path, settings: &Resolved, date: &str, now: &str) -> Re
             &settings.model,
             &settings.api_key,
             Duration::from_secs(settings.timeout_secs),
+            settings.disable_thinking,
         )
         .context("building LLM client")?,
     );

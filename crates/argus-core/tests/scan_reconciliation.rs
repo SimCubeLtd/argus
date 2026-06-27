@@ -22,7 +22,7 @@ fn params() -> ScanParams {
 /// A pass-2 finding payload (pass 1 reply is irrelevant — any array works).
 fn finding_json(vuln: &str, line: u32) -> String {
     format!(
-        r#"[{{"vulnerability_type":"{vuln}","description":"d","severity":"High","line_numbers":[{line}],"impact":"i","recommendation":"r","fix_example":""}}]"#
+        r#"[{{"vulnerability_type":"{vuln}","description":"d","severity":"High","line_numbers":[{line}],"reachability":"http request body reaches the sink","impact":"i","recommendation":"r","fix_example":""}}]"#
     )
 }
 

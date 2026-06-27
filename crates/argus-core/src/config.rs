@@ -43,6 +43,12 @@ pub struct EndpointConfig {
     /// Max in-flight LLM requests, so a first full scan can't overwhelm SGLang.
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
+    /// Send `chat_template_kwargs: {"enable_thinking": false}` on each request so
+    /// reasoning-capable models (Qwen3.x, GLM, ...) answer in `content` instead
+    /// of emitting chain-of-thought. Harmless for non-thinking models. Set false
+    /// only if an endpoint rejects the field.
+    #[serde(default = "default_true")]
+    pub disable_thinking: bool,
 }
 
 /// What to scan and how to bound chunk size.
@@ -78,6 +84,7 @@ impl Default for EndpointConfig {
             api_key: default_api_key(),
             timeout_secs: default_timeout_secs(),
             concurrency: default_concurrency(),
+            disable_thinking: default_true(),
         }
     }
 }
@@ -113,6 +120,9 @@ fn default_api_key() -> String {
 }
 fn default_timeout_secs() -> u64 {
     300
+}
+fn default_true() -> bool {
+    true
 }
 fn default_concurrency() -> usize {
     4

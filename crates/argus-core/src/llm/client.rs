@@ -24,10 +24,23 @@ pub struct OpenAiClient {
     base_url: String,
     model: String,
     api_key: String,
+    /// When true, send `chat_template_kwargs: {"enable_thinking": false}` so
+    /// reasoning-capable models (Qwen3.x, GLM, ...) reply with the answer in
+    /// `content` instead of leaking chain-of-thought. SGLang exposes no
+    /// server-side flag for this on Qwen3.6 — it must be set per request. Plain
+    /// OpenAI servers and non-thinking models ignore the extra field, so it is
+    /// safe to send unconditionally.
+    disable_thinking: bool,
 }
 
 impl OpenAiClient {
-    pub fn new(base_url: &str, model: &str, api_key: &str, timeout: Duration) -> Result<Self> {
+    pub fn new(
+        base_url: &str,
+        model: &str,
+        api_key: &str,
+        timeout: Duration,
+        disable_thinking: bool,
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(timeout)
             .build()
@@ -37,6 +50,7 @@ impl OpenAiClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             model: model.to_string(),
             api_key: api_key.to_string(),
+            disable_thinking,
         })
     }
 
@@ -65,7 +79,18 @@ impl OpenAiClient {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| {
+                // Prefer `content`; fall back to `reasoning_content` if a
+                // reasoning model/endpoint split its answer there and left
+                // `content` empty. The two-pass JSON extractor tolerates the
+                // chain-of-thought prefix this may carry.
+                let m = c.message;
+                if m.content.trim().is_empty() {
+                    m.reasoning_content
+                } else {
+                    m.content
+                }
+            })
             .unwrap_or_default();
         Ok(content)
     }
@@ -87,6 +112,9 @@ impl LlmClient for OpenAiClient {
                     content: user,
                 },
             ],
+            chat_template_kwargs: self.disable_thinking.then_some(ChatTemplateKwargs {
+                enable_thinking: false,
+            }),
         };
 
         match self.post_once(&body).await {
@@ -107,6 +135,15 @@ struct ChatRequest<'a> {
     model: &'a str,
     temperature: f32,
     messages: Vec<Message<'a>>,
+    /// Omitted from the JSON entirely when `None`, so plain OpenAI endpoints
+    /// never see an unfamiliar field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+#[derive(Serialize)]
+struct ChatTemplateKwargs {
+    enable_thinking: bool,
 }
 
 #[derive(Serialize)]
@@ -127,8 +164,22 @@ struct Choice {
 
 #[derive(Deserialize)]
 struct ResponseMessage {
-    #[serde(default)]
+    /// `content` may be present-but-null on reasoning models, so accept null as
+    /// empty rather than failing to parse.
+    #[serde(default, deserialize_with = "null_as_empty")]
     content: String,
+    /// Where reasoning models put chain-of-thought; used as a fallback when
+    /// `content` is empty. Often null on non-thinking replies.
+    #[serde(default, deserialize_with = "null_as_empty")]
+    reasoning_content: String,
+}
+
+/// Deserialize a possibly-null/absent JSON string field as an empty `String`.
+fn null_as_empty<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// A scripted [`LlmClient`] for tests: returns queued responses in order, and
@@ -172,5 +223,61 @@ impl LlmClient for MockLlmClient {
         let mut q = self.responses.lock().unwrap();
         Ok(q.pop_front()
             .unwrap_or_else(|| self.last.lock().unwrap().clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body(disable_thinking: bool) -> ChatRequest<'static> {
+        ChatRequest {
+            model: "m",
+            temperature: 0.0,
+            messages: vec![Message {
+                role: "user",
+                content: "hi",
+            }],
+            chat_template_kwargs: disable_thinking.then_some(ChatTemplateKwargs {
+                enable_thinking: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn request_includes_thinking_kwarg_when_enabled() {
+        let json = serde_json::to_string(&body(true)).unwrap();
+        assert!(json.contains("chat_template_kwargs"));
+        assert!(json.contains("\"enable_thinking\":false"));
+    }
+
+    #[test]
+    fn request_omits_kwarg_when_disabled_flag_off() {
+        // A plain OpenAI endpoint must never see the extra field.
+        let json = serde_json::to_string(&body(false)).unwrap();
+        assert!(!json.contains("chat_template_kwargs"));
+    }
+
+    #[test]
+    fn response_falls_back_to_reasoning_content_when_content_empty() {
+        let raw = r#"{"choices":[{"message":{"content":"","reasoning_content":"the answer"}}]}"#;
+        let parsed: ChatResponse = serde_json::from_str(raw).unwrap();
+        let m = parsed.choices.into_iter().next().unwrap().message;
+        let picked = if m.content.trim().is_empty() {
+            m.reasoning_content
+        } else {
+            m.content
+        };
+        assert_eq!(picked, "the answer");
+    }
+
+    #[test]
+    fn response_prefers_content_and_tolerates_null_reasoning() {
+        // The common case: content populated, reasoning_content explicitly null.
+        let raw = r#"{"choices":[{"message":{"content":"[]","reasoning_content":null}}]}"#;
+        let parsed: ChatResponse = serde_json::from_str(raw).unwrap();
+        let m = parsed.choices.into_iter().next().unwrap().message;
+        assert_eq!(m.content, "[]");
+        assert_eq!(m.reasoning_content, "");
     }
 }
